@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DeadlockFuzzer Simulator</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#eef1f4;--card:#fff;--ink:#1b2733;--mute:#5b6b7a;--line:#cfd7de;--acc:#0f766e;--bad:#b42318;--warn:#a15c07;--code:#e4e9ee}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121a21;--card:#1a242d;--ink:#e6edf3;--mute:#93a3b3;--line:#2f3d4a;--acc:#4fd1c0;--bad:#ff8a7a;--warn:#f2b45a;--code:#10171d}}
+:root[data-theme="dark"]{--bg:#121a21;--card:#1a242d;--ink:#e6edf3;--mute:#93a3b3;--line:#2f3d4a;--acc:#4fd1c0;--bad:#ff8a7a;--warn:#f2b45a;--code:#10171d}
+*,*:before,*:after{box-sizing:inherit}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:880px;margin:auto;padding:16px}
+h1{font-size:1.45rem;margin:0 0 4px}h2{font-size:1.05rem;margin:22px 0 8px}h3{font-size:1rem;margin:0 0 6px}
+p{margin:6px 0}.mute{color:var(--mute);font-size:.88rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;margin:8px 0}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}.grid .card{margin:0}
+pre{background:var(--code);padding:8px;border-radius:6px;font:12.5px/1.45 ui-monospace,Consolas,monospace;overflow-x:auto;margin:6px 0 0;white-space:pre}
+.seg{display:flex;flex-wrap:wrap;gap:6px}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:8px 12px;border-radius:6px}
+button.on{border-color:var(--acc);box-shadow:inset 0 0 0 1px var(--acc);font-weight:600}
+button.go{background:var(--acc);color:#fff;border-color:var(--acc);font-weight:600}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) button.go{color:#08201d}}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.sc{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.9rem}td,th{border:1px solid var(--line);padding:5px 8px;text-align:left}
+.bar{height:10px;background:var(--line);border-radius:5px;overflow:hidden;margin:3px 0 8px}.bar i{display:block;height:100%}
+.ok{color:var(--acc);font-weight:600}.bad{color:var(--bad);font-weight:600}.warn{color:var(--warn);font-weight:600}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
+input[type=range]{width:180px}
+details{margin-top:6px}summary{cursor:pointer;color:var(--mute)}
+svg{width:100%;max-width:340px;height:auto;display:block}
+</style></head><body>
+<main>
+<h1>DeadlockFuzzer simulator</h1>
+<p class="mute">Simulates the key findings of Joshi, Park, Sen and Roșu, “A Randomized Dynamic Program Analysis Technique for Detecting Real Deadlocks”, PLDI 2009, the latest of the five papers in the review.</p>
+
+<h2>1. Pick a program</h2>
+<div class="seg" id="seg"></div>
+<p id="note" class="mute"></p>
+<div class="grid" id="prog"></div>
+
+<h2>2. Run the two passes</h2>
+<div class="row">
+ <button class="go" id="b1">Pass 1: passive trace</button>
+ <button class="go" id="b2" disabled>Pass 2: active fuzzing</button>
+ <label class="mute">Runs per test <input type="range" id="n" min="50" max="1000" step="50" value="200"> <b id="nv">200</b></label>
+</div>
+<div id="r1"></div><div id="r2"></div>
+
+<h2>What the paper found, and where you can see it here</h2>
+<div class="card">
+<p><b>Predict, then confirm.</b> Pass 1 watches one normal run and builds a lock-dependency graph. Any cycle in it is only a <i>potential</i> deadlock, so the warning can be wrong.</p>
+<p><b>Zero false positives.</b> Pass 2 re-runs the program with a scheduler that pauses threads right before the risky lock calls. A deadlock is reported only if it really happens.</p>
+<p><b>Much higher hit rate.</b> A normal scheduler rarely produces the bad interleaving. The pausing scheduler produces it almost every run (compare the bars).</p>
+<p class="mute">Simplifications: the paper identifies a lock request by object creation context and call stack; here a request is identified by thread and line number. Pass 1 uses the paper’s cycle condition with disjoint held-lock sets (iGoodlock), limited to cycles of up to three threads.</p>
+</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const AB1='W W W L:A W L:B W U:B U:A',AB2='W W W L:B W L:A W U:A U:B';
+const SC={
+ ab:{t:'Opposite lock order',note:'T1 takes A then B, T2 takes B then A. A deadlock is possible, but only under one narrow interleaving.',th:{T1:{ops:AB1},T2:{ops:AB2}}},
+ jn:{t:'Looks cyclic, cannot deadlock',note:'Same lock order as before, but T2 starts only after T1 has finished. Pass 1 cannot see this ordering, so it raises a warning that is not a real bug.',th:{T1:{ops:AB1},T2:{ops:AB2,after:'T1'}}},
+ tri:{t:'Ring of three threads',note:'T1 holds A and wants B, T2 holds B and wants C, T3 holds C and wants A.',th:{T1:{ops:'W W L:A W L:B W U:B U:A'},T2:{ops:'W W L:B W L:C W U:C U:B'},T3:{ops:'W W L:C W L:A W U:A U:C'}}}
+};
+Object.values(SC).forEach(s=>Object.values(s.th).forEach(t=>t.p=t.ops.split(' ').map(x=>{const[k,l]=x.split(':');return{k,l}})));
+let cur='ab',ev=null,cands=null;
+const mul=a=>()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+const txt=o=>o.k=='W'?'compute()':(o.k=='L'?'lock('+o.l+')':'unlock('+o.l+')');
+
+function setSc(k){
+ cur=k;ev=cands=null;
+ document.querySelectorAll('#seg button').forEach(b=>b.classList.toggle('on',b.dataset.k==k));
+ const sc=SC[k];$('note').textContent=sc.note;
+ $('prog').innerHTML=Object.entries(sc.th).map(([n,t])=>`<div class="card"><b>${n}</b>${t.after?` <span class="mute">starts after ${t.after} ends</span>`:''}<pre>${t.p.map((o,i)=>String(i).padStart(2)+'  '+txt(o)).join('\n')}</pre></div>`).join('');
+ $('r1').innerHTML=$('r2').innerHTML='';$('b2').disabled=true;
+}
+$('seg').innerHTML=Object.entries(SC).map(([k,s])=>`<button data-k="${k}">${s.t}</button>`).join('');
+$('seg').onclick=e=>{if(e.target.dataset.k)setSc(e.target.dataset.k)};
+$('n').oninput=()=>$('nv').textContent=$('n').value;
+
+/* Pass 1: one serial, deadlock-free run; record (thread, held locks, lock wanted, line) */
+function passive(sc){
+ const out=[];
+ for(const n in sc.th){const held=[];
+  sc.th[n].p.forEach((o,i)=>{
+   if(o.k=='L'){out.push({t:n,l:o.l,s:i,H:[...held]});held.push(o.l)}
+   else if(o.k=='U')held.splice(held.indexOf(o.l),1);
+  });}
+ return out;
+}
+/* Cycles in the lock-dependency relation (distinct threads, disjoint held sets, up to 3 threads) */
+function cycles(ev){
+ const D=ev.filter(e=>e.H.length),out=[];
+ const disj=c=>c.every((a,i)=>c.every((b,j)=>i>=j||!a.H.some(x=>b.H.includes(x))));
+ const rec=(ch,st)=>{
+  const last=ch[ch.length-1];
+  if(ch.length>1&&ch[0].H.includes(last.l)&&disj(ch))out.push([...ch]);
+  if(ch.length>=3)return;
+  D.forEach((e,i)=>{if(i>st&&!ch.some(c=>c.t==e.t)&&e.H.includes(last.l)){ch.push(e);rec(ch,st);ch.pop()}});
+ };
+ D.forEach((e,i)=>rec([e],i));
+ return out;
+}
+const cname=c=>c.map(e=>`${e.t} holds ${e.H.join(',')} wants ${e.l}`).join(' ↔ ');
+
+/* Simulator: mode 'base' = OS-like scheduler with random time slices; 'fuzz' = pause at risky lock calls */
+function sim(sc,mode,rng,cand,log){
+ const names=Object.keys(sc.th),S={},own={},paused=new Set(),rel=new Set();
+ names.forEach(n=>S[n]={pc:0,held:[]});
+ const fin=n=>S[n].pc>=sc.th[n].p.length,nxt=n=>sc.th[n].p[S[n].pc];
+ const started=n=>!sc.th[n].after||fin(sc.th[n].after);
+ const can=n=>!fin(n)&&started(n)&&!(nxt(n).k=='L'&&own[nxt(n).l]);
+ const danger=n=>cand&&!rel.has(n+S[n].pc)&&nxt(n).k=='L'&&cand.some(e=>e.t==n&&e.s==S[n].pc);
+ const step=n=>{const o=nxt(n);
+  if(o.k=='L'){own[o.l]=n;S[n].held.push(o.l)}
+  else if(o.k=='U'){delete own[o.l];S[n].held.splice(S[n].held.indexOf(o.l),1)}
+  if(o.k!='W'&&log)log.push(`${n}: ${txt(o)} (line ${S[n].pc})`);
+  S[n].pc++};
+ for(let g=0;g<600;g++){
+  const run=names.filter(can);if(!run.length)break;
+  let pool=run;
+  if(mode=='fuzz'){
+   run.forEach(n=>{if(!paused.has(n)&&danger(n)){paused.add(n);log&&log.push(`${n}: PAUSED before ${txt(nxt(n))} (line ${S[n].pc})`)}});
+   pool=run.filter(n=>!paused.has(n));
+   if(!pool.length){log&&log.push('No unpaused thread can run, so release: '+[...paused].join(', '));
+    paused.forEach(n=>rel.add(n+S[n].pc));paused.clear();pool=run}
+  }
+  const n=pool[Math.floor(rng()*pool.length)],q=mode=='base'?1+Math.floor(rng()*8):1;
+  for(let k=0;k<q&&can(n);k++)step(n);
+ }
+ const dead=names.filter(n=>!fin(n)&&started(n)),waits={};
+ dead.forEach(n=>waits[n]=nxt(n).l);
+ return{dead:dead.length>0,S,own,waits,log};
+}
+
+function graph(r){
+ const th=Object.keys(r.waits);if(!th.length)return'';
+ const ord=[],seen=new Set();let c=th[0];
+ while(c&&!seen.has(c)){seen.add(c);ord.push({id:c,t:1});const l=r.waits[c];if(!l)break;ord.push({id:l,t:0});c=r.own[l]}
+ const n=ord.length,P=ord.map((o,i)=>{const a=-Math.PI/2+2*Math.PI*i/n;return{...o,x:170+95*Math.cos(a),y:105+75*Math.sin(a)}});
+ let s='<svg viewBox="0 0 340 210" role="img" aria-label="Wait cycle at the deadlock"><defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--bad)"/></marker></defs>';
+ P.forEach((a,i)=>{const b=P[(i+1)%n],dx=b.x-a.x,dy=b.y-a.y,d=Math.hypot(dx,dy)||1,u=19/d;
+  s+=`<line x1="${a.x+dx*u}" y1="${a.y+dy*u}" x2="${b.x-dx*u}" y2="${b.y-dy*u}" stroke="var(--bad)" stroke-width="1.6" marker-end="url(#ar)"/>`});
+ P.forEach(a=>{s+=a.t?`<circle cx="${a.x}" cy="${a.y}" r="16" fill="var(--card)" stroke="var(--ink)"/>`:`<rect x="${a.x-15}" y="${a.y-12}" width="30" height="24" rx="3" fill="var(--code)" stroke="var(--ink)"/>`;
+  s+=`<text x="${a.x}" y="${a.y+4}" text-anchor="middle" font-size="12" fill="var(--ink)">${a.id}</text>`});
+ return s+'</svg><p class="mute">Circles are threads, squares are locks. A thread points to the lock it waits for, and a lock points to the thread holding it.</p>';
+}
+
+$('b1').onclick=()=>{
+ const sc=SC[cur];ev=passive(sc);cands=cycles(ev);
+ $('r2').innerHTML='';
+ $('r1').innerHTML=`<div class="card"><h3>Pass 1: passive trace</h3>
+ <p>One normal run, executed with no contention. No deadlock happens, but every lock request is recorded together with the locks already held.</p>
+ <div class="sc"><table><tr><th>Thread</th><th>Holds</th><th>Wants</th><th>Line</th></tr>${ev.map(e=>`<tr><td>${e.t}</td><td>${e.H.join(', ')||'none'}</td><td>${e.l}</td><td>${e.s}</td></tr>`).join('')}</table></div>
+ <p>${cands.length?`<span class="warn">${cands.length} potential deadlock${cands.length>1?'s':''} found</span> in the lock-dependency graph:`:'<span class="ok">No cycle found</span>, so nothing to confirm.'}</p>
+ ${cands.map(c=>`<p>• ${cname(c)}</p>`).join('')}</div>`;
+ $('b2').disabled=!cands.length;
+};
+
+$('b2').onclick=()=>{
+ const sc=SC[cur],N=+$('n').value,rng=mul((Math.random()*4294967296)>>>0);
+ let bh=0;for(let i=0;i<N;i++)if(sim(sc,'base',rng,null,null).dead)bh++;
+ let conf=0;
+ const cards=cands.map(c=>{
+  let fh=0,smp=null;
+  for(let i=0;i<N;i++){const r=sim(sc,'fuzz',rng,c,[]);if(r.dead){fh++;if(!smp||!smp.dead)smp=r}else if(!smp)smp=r}
+  if(fh)conf++;
+  const v=fh?`<span class="bad">Real deadlock, reproduced ${fh} of ${N} runs.</span> It is reported as a bug, with the schedule that causes it.`:`<span class="ok">Never reproduced in ${N} runs.</span> It is not reported as a bug, so the warning does not become a false positive.`;
+  return`<div class="card"><h3>${cname(c)}</h3>
+  <div class="mute">Pausing scheduler: ${fh}/${N} runs deadlocked</div><div class="bar"><i style="width:${100*fh/N}%;background:var(--acc)"></i></div>
+  <p>${v}</p>${smp.dead?graph(smp):''}
+  <details><summary>Event log of one fuzzed run</summary><pre>${smp.log.join('\n')||'(no lock events)'}</pre></details></div>`}).join('');
+ $('r2').innerHTML=`<div class="card"><h3>Pass 2: active random scheduling</h3>
+ <div class="mute">Normal scheduler (random time slices, no pausing): ${bh}/${N} runs deadlocked</div><div class="bar"><i style="width:${100*bh/N}%;background:var(--warn)"></i></div>
+ <table><tr><th>Warnings from Pass 1</th><th>Confirmed real</th><th>False alarms reported</th></tr><tr><td>${cands.length}</td><td>${conf}</td><td>0</td></tr></table></div>${cards}`;
+};
+setSc('ab');
+</script></body></html>
